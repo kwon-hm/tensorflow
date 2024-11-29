@@ -1,0 +1,376 @@
+import os
+import math
+import numpy as np
+import pandas as pd
+import seaborn as sns
+from time import sleep
+import mongoDB as mongo
+import tensorflow as tf
+from tensorflow import keras
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error
+plt.style.use('fivethirtyeight')
+conn = mongo.conn('deviceStats')
+
+mem, cpu, network, time, day = [], [], [], [], []
+
+print('==========================')
+print('==========================')
+
+TIME_STEPS = 60
+rate = 0.01
+shuffle = False
+batch_size = 128
+validation_split = 0.1
+epochs = 100
+THRESHOLD = 0.061
+# checkpoint_name='AD 예측의 예측/checkpoint(e-100, b-64, t-60)'
+checkpoint_name='AD 예측의 예측/checkpoint'
+print('TIME_STEPS: ', TIME_STEPS)
+print('rate: ', rate)
+print('shuffle: ', shuffle)
+print('batch_size: ', batch_size)
+print('validation_split: ', validation_split)
+print('epochs: ', epochs)
+print('THRESHOLD: ', THRESHOLD)
+checkpoint_path = "AD 예측의 예측/checkpoint/cp.ckpt"
+print('checkpoint_path: ', checkpoint_path)
+
+print('==========================')
+print('==========================')
+
+# 모델의 가중치를 저장하는 콜백 만들기
+cp_callback = tf.keras.callbacks.ModelCheckpoint(filepath=checkpoint_path, save_weights_only=True, verbose=1)
+
+i_list = conn.find({'dynamicStat': 1})
+for i in i_list:
+    date = datetime.fromtimestamp(i['time']['current'] // 1000)
+    time.append(date)
+
+    cpu_used = i['currentLoad']['currentload']
+    cpu.append(cpu_used)
+
+    mem_used = i['mem']['used']/ 1024 / 1024 / 1024
+    mem.append(mem_used)
+
+    if(i['mem']['used'] > 29081968128.0):
+        print('!!!!!!!!!!!!!!!!!!', i['time']['current']//1000)
+
+    net_used = i['networkStats'][0]['rx_bytes']
+    network.append(net_used)
+"""
+1. Get mongo data
+"""
+df = pd.DataFrame()
+df['Date'] = time
+df['Cpu'] = cpu
+df['Mem'] = mem
+df['Network'] = network
+df.set_index('Date', inplace=True) 
+df = df.loc[:,['Cpu', 'Mem', 'Network']] 
+df = df.astype(float)
+print(df)
+print(df.shape)
+# plt.title('Model')
+# plt.xlabel('Date')
+# plt.ylabel('Used')
+# plt.plot(df[['Cpu', 'Mem', 'Network']])
+# plt.legend(['Cpu', 'Mem', 'Network'], loc = 'lower right')
+# plt.show()
+
+"""
+2. Model data
+"""
+training_data_len = int(len(df) * 0.8)
+test_size = len(df) - training_data_len
+
+scaler = MinMaxScaler()
+scaler.fit(df)
+df[['Cpu', 'Mem', 'Network']] = scaler.transform(df[['Cpu', 'Mem', 'Network']])
+
+df_train = df[0:training_data_len]
+# df_train[['Cpu', 'Mem', 'Network']] = scaler.transform(df_train[['Cpu', 'Mem', 'Network']])
+df_test = df[training_data_len:len(df)]
+# scaler.fit(df_test)
+# df_test[['Cpu', 'Mem', 'Network']] = scaler.transform(df_test[['Cpu', 'Mem', 'Network']])
+
+def create_dataset(X, time_steps=10):
+    xs, ys = [], []
+    for i in range(len(X) - time_steps):
+        xs.append(X[i: (i + time_steps)].values.reshape(time_steps,3)),
+        ys.append(X[i + 1: (i + time_steps) + 1].values.reshape(time_steps,3))
+    return np.array(xs), np.array(ys)
+
+x_train, y_train = create_dataset(
+    df_train[['Cpu', 'Mem', 'Network']], TIME_STEPS
+)
+x_test, y_test = create_dataset(
+    df_test[['Cpu', 'Mem', 'Network']], TIME_STEPS
+)
+print('--------------------------')
+print('x_train.shape: ', x_train.shape)
+print('y_train.shape: ', y_train.shape)
+print('--------------------------')
+
+"""
+3. Model & learning
+"""
+def create_model():
+    model = keras.models.Sequential()
+    model.add(keras.layers.LSTM(128, activation='relu', input_shape=(x_train.shape[1], x_train.shape[2])))
+    model.add(keras.layers.Dropout(rate=rate))
+    model.add(keras.layers.RepeatVector(TIME_STEPS))
+    model.add(keras.layers.LSTM(128, activation='relu', return_sequences=True))
+    model.add(keras.layers.Dropout(rate=rate))
+    # model.add(keras.layers.Dense(32))
+    model.add(keras.layers.TimeDistributed(keras.layers.Dense(x_train.shape[2])))
+    # model.add(keras.layers.Dense(3))
+    model.compile(optimizer='adam', loss='mae')
+    model.summary()
+    return model
+
+
+if(os.path.isfile(checkpoint_name + '/cp.ckpt.index')):
+    model = keras.models.load_model(checkpoint_name)
+else:
+    model = create_model()
+    history = model.fit(
+        x_train,
+        y_train,
+        shuffle=shuffle,
+        batch_size=batch_size,
+        validation_split=validation_split,
+        callbacks=[cp_callback],
+        epochs=epochs
+    )
+    # loss, acc = model.evaluate(x_train, y_train, verbose=2)
+    # print("정확도: {:5.2f}%".format(100*acc))
+    model.save('AD 예측의 예측/checkpoint')
+    print('loss: ',history.history['loss']);print()
+    plt.figure(figsize = (10,5))
+    plt.plot(history.history['loss'], label='train')
+    plt.plot(history.history['val_loss'], label='validation')
+    plt.show()
+
+"""
+4. Reconstruction error
+"""
+X_train_pred = model.predict(x_train)
+print('1: ', np.square(X_train_pred - x_train)[0])
+print('2: ', np.mean(np.square(X_train_pred - x_train), axis=1)[0])
+print('3: ', np.max(np.mean(np.square(X_train_pred - x_train), axis=1), axis=1)[0])
+# train_mae_loss = np.max(np.mean(np.square(X_train_pred - x_train), axis=1), axis=1)
+# train_mae_loss_min = np.min(np.mean(np.square(X_train_pred - x_train), axis=1), axis=1)
+# sns.distplot(train_mae_loss, bins=100, kde=True)
+# plt.show()
+
+"""
+5. Threshold
+"""
+X_test_pred = model.predict(x_test)
+test_mae_loss = np.max(np.mean(np.square(X_test_pred - x_test), axis=1), axis=1)
+print('--------------------------')
+print('test_mae_loss: ', test_mae_loss)
+print('--------------------------')
+
+# dist = np.linalg.norm(x_test - X_test_pred, axis=1)
+# scores = dist.copy()
+# scores.sort()
+# cut_off = int(0.90 * len(scores))
+# print('Cutoff value:', cut_off)
+# ts = scores[cut_off]
+
+test_score_df = pd.DataFrame(index=df_test[:-(TIME_STEPS)].index)
+test_score_df['loss'] = test_mae_loss
+test_score_df['threshold'] = THRESHOLD
+test_score_df['anomaly'] = test_mae_loss > test_score_df.threshold
+test_score_df['memory'] = df_test[:-(TIME_STEPS)].Mem
+test_score_df['cpu'] = df_test[:-(TIME_STEPS)].Cpu
+
+
+print('--------------------------')
+print('test_score_df: ', test_score_df)
+print('--------------------------')
+plt.plot(test_score_df.index, test_score_df.loss, label='loss')
+plt.plot(test_score_df.index, test_score_df.threshold, label='threshold')
+# plt.plot(test_score_df.index, test_score_df.ts, label='ts')
+plt.xticks(rotation=25)
+plt.show()
+
+anomalies = test_score_df[test_score_df.anomaly == True]
+anomalies.describe()
+print('--------------------------')
+print('anomalies.describe(): ', anomalies.describe())
+print('--------------------------')
+print('anomalies: ', anomalies)
+print('--------------------------')
+
+"""
+6. Anomaly point
+"""
+plt.plot(df_test[:][['Cpu', 'Mem', 'Network']])
+plt.plot(
+    anomalies.index,
+    anomalies.cpu,
+    'o',
+    color='green',
+    label='anomaly'
+)
+plt.plot(
+    anomalies.index,
+    anomalies.memory,
+    'o',
+    color='orange',
+    label='anomaly'
+)
+plt.xticks(rotation=25)
+plt.show()
+
+def create_test_dataset(time_data, cpu_data, mem_data, network_data, time_steps_data):
+    df_ = pd.DataFrame()
+    df_['Date'] = time_data
+    df_['Cpu'] = cpu_data
+    df_['Mem'] = mem_data
+    df_['Network'] = network_data
+    df_.set_index('Date', inplace=True) 
+    df_ = df_.loc[:,['Cpu', 'Mem', 'Network']] 
+    df_ = df_.astype(float)
+    df_test_ = df_[:]
+    df_test_[['Cpu', 'Mem', 'Network']] = scaler.transform(df_test_[['Cpu', 'Mem', 'Network']])
+    xx = []
+    xx.append(df_test_[:].values.reshape(time_steps_data,3))
+    return np.array(xx)
+
+def create_new_test_dataset(time_, cpu_, mem_, network_, time_steps_data, test_predic):
+    df_ = pd.DataFrame()
+    time_.append(time_[-1] + timedelta(seconds=1))
+    cpu_.append(test_predic[-1][0])
+    mem_.append(test_predic[-1][1])
+    network_.append(test_predic[-1][2])
+    df_['Date'] = time_
+    df_['Cpu'] = cpu_
+    df_['Mem'] = mem_
+    df_['Network'] = network_
+    df_.set_index('Date', inplace=True) 
+    df_ = df_.loc[:,['Cpu', 'Mem', 'Network']] 
+    df_ = df_.astype(float)
+    df_test_ = df_[:]
+    df_test_[['Cpu', 'Mem', 'Network']] = scaler.transform(df_test_[['Cpu', 'Mem', 'Network']])
+    xx = []
+    xx.append(df_test_[:].values.reshape(time_steps_data,3))
+    return np.array(xx)
+
+mem_, cpu_, network_, time_ = [], [], [], []
+print('len(df): ', len(df))
+print('training_data_len: ', training_data_len)
+print(len(df) - training_data_len)
+
+
+training_data_len = len(df) - TIME_STEPS
+while training_data_len < len(df):
+    db_data = conn.find({'dynamicStat': 1}).limit(1)
+    
+    date_ = datetime.fromtimestamp(db_data[0]['time']['current'] // 1000)
+    time_.append(date_)
+
+    cpu_used = db_data[0]['currentLoad']['currentload']
+    cpu_.append(cpu_used)
+
+    mem_used = db_data[0]['mem']['used']/ 1024 / 1024 / 1024
+    mem_.append(mem_used)
+
+    net_used = db_data[0]['networkStats'][0]['rx_bytes']
+    network_.append(net_used)
+    test_predic = []
+    if(len(time_) == TIME_STEPS):
+        x_test_ = create_test_dataset(time_, cpu_, mem_, network_, TIME_STEPS)
+        test_predic = model.predict(x_test_)
+
+        test_mae_loss_ = np.max(np.mean(np.square(test_predic - x_test_), axis=1), axis=1)
+        if(test_mae_loss_ > THRESHOLD):
+            print('***** Start *****')
+            print('*****************')
+            tt = pd.DataFrame(index=df_test[:].index)
+            print(time_[0])
+            print('test_mae_loss_: ', test_mae_loss_)
+            print('***** End *****')
+            print('*****************')
+            print()
+
+        time_.pop(0)
+        cpu_.pop(0)
+        mem_.pop(0)
+        network_.pop(0)
+        training_data_len += 1
+        if(training_data_len == len(df)):
+            print(test_predic[0])
+            # print(test_predic[0][9][0])
+            # print(test_predic[0][9][1])
+            # print(test_predic[0][9][2])
+            print(scaler.inverse_transform(test_predic[0]))
+            count = 0
+
+            while count <= TIME_STEPS:
+
+                predic_data = create_new_test_dataset(time_, cpu_, mem_, network_, TIME_STEPS, scaler.inverse_transform(test_predic[0]))
+                
+                test_predic = model.predict(predic_data)
+
+                # print(np.square(test_predic - predic_data))
+                # print(np.mean(np.square(test_predic - predic_data), axis=1))
+                # print(np.max(np.mean(np.square(test_predic - predic_data), axis=1), axis=1))
+
+
+                # predic = scaler.inverse_transform(test_predic[0])
+                print('count: ', count)
+                # print(predic[predic.shape[0]-1][0], predic[predic.shape[0]-1][1], predic[predic.shape[0]-1][2])
+                # time_.append(time_[-1] + timedelta(seconds=1))
+                # cpu_.append(predic[-1][0])
+                # mem_.append(predic[-1][1])
+                # network_.append(predic[-1][2])
+                # df_ = pd.DataFrame()
+                # df_['Date'] = time_
+                # df_['Cpu'] = cpu_
+                # df_['Mem'] = mem_
+                # df_['Network'] = network_
+                # df_.set_index('Date', inplace=True) 
+                # df_ = df_.loc[:,['Cpu', 'Mem', 'Network']] 
+                # df_ = df_.astype(float)
+                # df_test_ = df_[:]
+                # df_test_[['Cpu', 'Mem', 'Network']] = scaler.transform(df_test_[['Cpu', 'Mem', 'Network']])
+                # x_test, y_test = create_dataset(df_test_[['Cpu', 'Mem', 'Network']], TIME_STEPS)
+                # x_test = inverse(test_predic)
+
+
+                # X_test_pred = model.predict(x_test)
+                test_mae_loss = np.max(np.mean(np.square(test_predic - predic_data), axis=1), axis=1)
+                test_pred = scaler.inverse_transform(test_predic[-1])
+                print('test_pred: ', test_pred[-1])
+                # print('test_mae_loss: ', scaler.inverse_transform(test_mae_loss[0]))
+
+                if(test_mae_loss > THRESHOLD):
+                    print('***** Start *****')
+                    print('*****************')
+                    df_ = pd.DataFrame()
+                    df_test_ = df_[:]
+                    tt = pd.DataFrame(index=df_test_[:].index)
+                    print(time_[0])
+                    print('test_mae_loss: ', test_mae_loss)
+                    print('***** End *****')
+                    print('*****************')
+                    print()
+
+                time_.pop(0)
+                cpu_.pop(0)
+                mem_.pop(0)
+                network_.pop(0)
+                
+                count += 1
+
+
+    else:
+        training_data_len += 1
+
+print('training_data_len:', training_data_len)
